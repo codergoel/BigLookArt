@@ -7,35 +7,50 @@ This script demonstrates how to:
   2. Gather unique values for each relevant attribute from buyer_data.csv.
   3. Enrich art_data.csv with those attributes by calling Ollama (one call per artwork).
   4. Compute a match score for (artwork, buyer) pairs and output recommendations.
-The script uses the /v1/completions endpoint (rather than /v1/chat) since your
+The script uses the /v1/completions endpoint (via a Flask wrapper) since your
 Ollama instance is running in completions mode.
 Usage:
   python recommendation_pipeline.py
 Requirements:
-  pip install requests json5
+  pip install requests json5 rich
 Author: Tanmay Goel (Adapted)
 Date: 2025-02-16
 """
+
 import time
 import os
 import csv
 import requests
 import json5  # More forgiving JSON parser
 import functools
+import logging
+from rich.logging import RichHandler
 from typing import List, Dict, Set
+
 ##############################################################################
 # 1. CONFIGURATION
 ##############################################################################
-DEBUG = True                   # Toggle debug prints
+# Set up Rich logging for structured, colorful output
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="[%H:%M:%S]",
+    handlers=[RichHandler()]
+)
+logger = logging.getLogger("recommendation_pipeline")
+
+# File paths and parameters
 ART_DATA_FILE = "art_data.csv"
 BUYER_DATA_FILE = "buyer_250.csv"
 ENRICHED_ART_DATA_FILE = "enriched_art_data.csv"
 RECOMMENDATIONS_FILE   = "recommendations.csv"
 TOP_K = 5                      # Number of top matches per artwork
-CALL_COUNT = 0                 # Count how many times we call Ollama
-# Define the model and API endpoint for Ollama (completions endpoint)
+CALL_COUNT = 0                 # Count of calls to Ollama
+
+# Define the model and API endpoint for Ollama (using the Flask wrapper)
 MODEL_NAME = "llama2"
 OLLAMA_SERVER_URL = "http://172.24.16.73:8001/infer"
+
 ##############################################################################
 # 1a. HELPER FUNCTION TO EXTRACT JSON FROM RESPONSE TEXT
 ##############################################################################
@@ -50,11 +65,17 @@ def extract_json_from_text(text: str) -> str:
     if start != -1 and end != -1 and end > start:
         return text[start:end+1]
     return text
+
 ##############################################################################
 # 2. LOCAL OLLAMA HELPER FUNCTION
 ##############################################################################
 @functools.lru_cache(maxsize=100)
 def call_ollama(prompt: str) -> str:
+    """
+    Calls the local Ollama server's endpoint with the given prompt.
+    Returns the generated text.
+    Retries up to 3 times on failure.
+    """
     global CALL_COUNT
     CALL_COUNT += 1
     payload = {
@@ -64,17 +85,15 @@ def call_ollama(prompt: str) -> str:
         "max_tokens": 512
     }
     headers = {"Content-Type": "application/json"}
-    if DEBUG:
-        print(f"\n[DEBUG] ----- Ollama Call #{CALL_COUNT} -----")
-        print(f"[DEBUG] Prompt length: {len(prompt)} chars")
-        print(f"[DEBUG] Prompt excerpt:\n{prompt[:200]}...\n")
+    logger.debug("----- Ollama Call #%d -----", CALL_COUNT)
+    logger.debug("Prompt length: %d chars", len(prompt))
+    logger.debug("Prompt excerpt:\n%s...", prompt[:200])
     retry_attempts = 3
     for attempt in range(retry_attempts):
         try:
             response = requests.post(OLLAMA_SERVER_URL, json=payload, headers=headers, timeout=300)
             if response.status_code == 429:
-                if DEBUG:
-                    print("[DEBUG] 429 Rate limit encountered. Sleeping 2 seconds before retrying...")
+                logger.warning("429 Rate limit encountered. Sleeping 2 seconds before retrying...")
                 time.sleep(2)
                 continue
             if response.status_code != 200:
@@ -82,21 +101,19 @@ def call_ollama(prompt: str) -> str:
                     f"Ollama server call failed. Status: {response.status_code}\nResponse: {response.text}"
                 )
             data = response.json()
-            # Check for "generated_text" first
+            # Check for "generated_text" first, fallback to "choices" if necessary.
             if "generated_text" in data:
                 text = data["generated_text"]
             elif "choices" in data and len(data["choices"]) > 0:
                 text = data["choices"][0]["text"]
             else:
                 raise RuntimeError("Unexpected response format: " + str(data))
-            if DEBUG:
-                print(f"[DEBUG] Raw JSON response: {data}")
-                print(f"[DEBUG] Response excerpt:\n{text[:200]}...\n")
+            logger.debug("Raw JSON response: %s", data)
+            logger.debug("Response excerpt:\n%s...", text[:200])
             time.sleep(5)
             return text.strip()
         except requests.exceptions.RequestException as e:
-            if DEBUG:
-                print(f"[DEBUG] Attempt {attempt + 1}/{retry_attempts} failed with error: {e}")
+            logger.error("Attempt %d/%d failed with error: %s", attempt + 1, retry_attempts, e)
             time.sleep(2)
     raise RuntimeError("Ollama server call failed after multiple attempts.")
 
@@ -105,12 +122,9 @@ def call_ollama(prompt: str) -> str:
 ##############################################################################
 def identify_relevant_buyer_attributes(buyer_columns: List[str]) -> List[str]:
     """
-    Given a list of buyer data columns, uses Ollama to determine which columns
-    are relevant for matching artwork (e.g., style, medium, motivation).
+    Uses Ollama to determine which buyer data columns are relevant for matching artwork.
     """
-    if DEBUG:
-        print("\n[DEBUG] identify_relevant_buyer_attributes()")
-        print(f"[DEBUG] Buyer columns: {buyer_columns}")
+    logger.info("Identifying relevant buyer attributes from columns: %s", buyer_columns)
     columns_str = "\n- ".join(buyer_columns)
     prompt = f"""
 We have a buyer dataset with the following columns:
@@ -124,19 +138,16 @@ No extra text or repeated prompt. For example:
 }}
 """
     response_text = call_ollama(prompt)
-    # Extract JSON portion from the response
     json_text = extract_json_from_text(response_text)
     try:
         data = json5.loads(json_text)
         relevant = data.get("relevant_columns", [])
     except Exception as e:
-        if DEBUG:
-            print(f"[DEBUG] JSON parsing error: {e}")
-        # Fallback default if parsing fails.
+        logger.error("JSON parsing error: %s", e)
         relevant = ["Preferred Art Styles", "Favorite Mediums", "Buying Motivation"]
-    if DEBUG:
-        print(f"[DEBUG] relevant columns from Ollama: {relevant}")
+    logger.info("Relevant columns determined: %s", relevant)
     return relevant
+
 ##############################################################################
 # 4. STEP TWO: Gather Unique Values
 ##############################################################################
@@ -145,24 +156,20 @@ def gather_unique_values_for_attributes(
     relevant_columns: List[str]
 ) -> Dict[str, Set[str]]:
     """
-    Given buyer data and a list of relevant columns, extracts all unique values for each column.
+    Extracts unique values for each relevant column from the buyer data.
     """
-    if DEBUG:
-        print("\n[DEBUG] gather_unique_values_for_attributes()")
-        print(f"[DEBUG] # Buyer rows: {len(buyer_data)}")
-        print(f"[DEBUG] Relevant columns: {relevant_columns}")
+    logger.info("Gathering unique values from %d buyer rows for columns: %s", len(buyer_data), relevant_columns)
     attribute_values = {attr: set() for attr in relevant_columns}
     for row in buyer_data:
         for attr in relevant_columns:
             raw_value = row.get(attr, "")
-            # Assume comma-separated values; strip whitespace.
             items = [x.strip() for x in raw_value.split(",") if x.strip()]
             attribute_values[attr].update(items)
-    if DEBUG:
-        for attr in relevant_columns:
-            vals = list(attribute_values[attr])[:10]
-            print(f"[DEBUG] Unique values for {attr} (partial): {vals}")
+    for attr in relevant_columns:
+        vals = list(attribute_values[attr])[:10]
+        logger.debug("Unique values for %s (partial): %s", attr, vals)
     return attribute_values
+
 ##############################################################################
 # 5. STEP THREE: Enrich Artwork Data
 ##############################################################################
@@ -172,17 +179,13 @@ def enrich_artwork_data(
     relevant_columns: List[str]
 ) -> List[Dict[str, str]]:
     """
-    For each artwork, uses Ollama to label the artwork with the relevant buyer attribute values.
+    Labels each artwork with buyer attribute values using Ollama.
     """
-    if DEBUG:
-        print("\n[DEBUG] enrich_artwork_data()")
-        print(f"[DEBUG] # Artwork rows: {len(art_data)}")
-        print(f"[DEBUG] relevant_columns: {relevant_columns}")
+    logger.info("Enriching artwork data for %d artworks.", len(art_data))
     enriched_data = []
     for idx, row in enumerate(art_data, start=1):
         artwork_id = row["Artwork ID"]
         description = row["Description"]
-        # Prepare a dictionary of possible values for each attribute.
         possible_dict = {attr: list(attribute_values[attr]) for attr in relevant_columns}
         prompt = f"""
 Below is an artwork description:
@@ -198,28 +201,24 @@ For example:
   "Buying Motivation": ["Support Artists"]
 }}
 """
-        if DEBUG:
-            print(f"\n[DEBUG] Artwork #{idx}, ID = {artwork_id}")
-            print(f"[DEBUG] Artwork description (partial): {description[:150]}...")
+        logger.info("Processing Artwork #%d (ID: %s)", idx, artwork_id)
+        logger.debug("Artwork description (partial): %s...", description[:150])
         response_text = call_ollama(prompt)
-        # Extract JSON portion from the response
         json_text = extract_json_from_text(response_text)
         new_row = dict(row)
         try:
             data = json5.loads(json_text)
-            if DEBUG:
-                print(f"[DEBUG] JSON response from Ollama for Artwork ID={artwork_id}: {data}")
-            # For each attribute, store the chosen values as a comma-separated string.
+            logger.debug("JSON response for Artwork ID=%s: %s", artwork_id, data)
             for attr in relevant_columns:
                 chosen_vals = data.get(attr, [])
                 new_row[attr] = ", ".join(chosen_vals)
         except Exception as e:
-            if DEBUG:
-                print(f"[DEBUG] JSON parsing error for Artwork ID={artwork_id}: {e}")
+            logger.error("JSON parsing error for Artwork ID=%s: %s", artwork_id, e)
             for attr in relevant_columns:
                 new_row[attr] = ""
         enriched_data.append(new_row)
     return enriched_data
+
 ##############################################################################
 # 6. STEP FOUR: Compute Match Score & Generate Recommendations
 ##############################################################################
@@ -229,7 +228,7 @@ def compute_match_score(
     relevant_columns: List[str]
 ) -> float:
     """
-    Computes a simple Jaccard similarity between artwork and buyer attribute sets.
+    Computes a simple Jaccard similarity score between artwork and buyer attributes.
     """
     total_score = 0.0
     for attr in relevant_columns:
@@ -242,6 +241,7 @@ def compute_match_score(
         score_attr = (len(overlap) / len(union)) if union else 0.0
         total_score += score_attr
     return (total_score / len(relevant_columns)) if relevant_columns else 0.0
+
 def generate_recommendations(
     enriched_art_data: List[Dict[str, str]],
     buyer_data: List[Dict[str, str]],
@@ -249,7 +249,7 @@ def generate_recommendations(
     top_k: int = 5
 ) -> List[Dict[str, str]]:
     """
-    For each artwork, computes match scores against all buyers and selects the top_k matches.
+    Computes match scores for each artwork against all buyers and selects the top matches.
     """
     recommendations = []
     for art in enriched_art_data:
@@ -268,6 +268,7 @@ def generate_recommendations(
                 "Match Score": f"{sc:.3f}"
             })
     return recommendations
+
 ##############################################################################
 # 7. MAIN LOGIC
 ##############################################################################
@@ -276,46 +277,45 @@ def main():
     with open(BUYER_DATA_FILE, "r", encoding="utf-8") as f:
         buyer_rows = list(csv.DictReader(f))
     buyer_columns = list(buyer_rows[0].keys())
-    print("[DEBUG] Buyer columns found in CSV:", buyer_columns)
-    print(f"[DEBUG] # Buyer rows: {len(buyer_rows)}")
+    logger.info("Buyer columns found: %s", buyer_columns)
+    logger.info("Number of buyer rows: %d", len(buyer_rows))
+    
     # 2) Identify relevant buyer attributes using Ollama
     relevant_attrs = identify_relevant_buyer_attributes(buyer_columns)
-    print("[DEBUG] Relevant buyer attributes (from Ollama):", relevant_attrs)
+    logger.info("Relevant buyer attributes: %s", relevant_attrs)
+    
     # 3) Gather unique attribute values from buyer data
     attr_values_dict = gather_unique_values_for_attributes(buyer_rows, relevant_attrs)
-    print("[DEBUG] Unique values for each relevant attribute:")
+    logger.info("Unique attribute values:")
     for k, v in attr_values_dict.items():
-        print(f"  {k}: {v}")
+        logger.info("  %s: %s", k, list(v)[:10])
+    
     # 4) Read art_data.csv
     with open(ART_DATA_FILE, "r", encoding="utf-8") as f:
         art_rows = list(csv.DictReader(f))
-    print(f"[DEBUG] # Artwork rows: {len(art_rows)}")
+    logger.info("Number of artwork rows: %d", len(art_rows))
     for idx, art in enumerate(art_rows, start=1):
-        print(f"[DEBUG] Artwork #{idx} -> ID: {art['Artwork ID']}, Desc partial: {art['Description'][:100]}...")
+        logger.info("Artwork #%d -> ID: %s, Description: %s...", idx, art["Artwork ID"], art["Description"][:100])
+    
     # 5) Enrich artwork data using Ollama calls
-    print("[DEBUG] Enriching art_data.csv with relevant attributes using Ollama calls...")
+    logger.info("Enriching artwork data with relevant attributes via Ollama...")
     enriched_art = enrich_artwork_data(art_rows, attr_values_dict, relevant_attrs)
-    # Save enriched art data to CSV
-    if enriched_art:
-        all_cols = list(enriched_art[0].keys())
-    else:
-        all_cols = ["Artwork ID", "Description"]
     with open(ENRICHED_ART_DATA_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=all_cols)
+        fieldnames = list(enriched_art[0].keys()) if enriched_art else ["Artwork ID", "Description"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(enriched_art)
-    print(f"[DEBUG] Saved enriched artwork data to {ENRICHED_ART_DATA_FILE}.")
-    # 6) Compute match scores & generate recommendations
-    print("[DEBUG] Computing match scores and generating final recommendations...")
+    logger.info("Saved enriched artwork data to %s.", ENRICHED_ART_DATA_FILE)
+    
+    # 6) Compute match scores and generate recommendations
+    logger.info("Computing match scores and generating recommendations...")
     recommendations = generate_recommendations(enriched_art, buyer_rows, relevant_attrs, TOP_K)
-    rec_cols = ["Artwork ID", "Buyer ID", "Match Score"]
     with open(RECOMMENDATIONS_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=rec_cols)
+        writer = csv.DictWriter(f, fieldnames=["Artwork ID", "Buyer ID", "Match Score"])
         writer.writeheader()
         writer.writerows(recommendations)
-    print(f"[DEBUG] Saved final recommendations to {RECOMMENDATIONS_FILE}.")
-    print("[DEBUG] Done!")
-    print("[DEBUG] Total calls to Ollama:", CALL_COUNT)
+    logger.info("Saved recommendations to %s.", RECOMMENDATIONS_FILE)
+    logger.info("Process complete. Total calls to Ollama: %d", CALL_COUNT)
+
 if __name__ == "__main__":
     main()
-
